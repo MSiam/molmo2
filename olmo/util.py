@@ -10,6 +10,7 @@ import math
 import threading
 import uuid
 
+import torch.nn as nn
 import torch.multiprocessing as mp
 import time
 import warnings
@@ -601,6 +602,19 @@ def generate_uuid() -> str:
     Generate a unique ID.
     """
     return str(uuid.uuid4())
+
+def find_all_linear_names(model):
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    if 'output_layer' in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove('output_layer')
+    return list(lora_module_names)
 
 
 def select_checkpoint(checkpoint, prefer_unsharded=False, quiet=False):

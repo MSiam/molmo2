@@ -226,9 +226,9 @@ class InfEvalConfig(BaseConfig):
     distributed: bool = True
     """
     Run inference evaluation with the distributed model
-    
-    If false, this will temporarily load a non-distributed model onto the GPU to use for inference, 
-    this will require more memory as  and some initial setup time. However this can be much faster 
+
+    If false, this will temporarily load a non-distributed model onto the GPU to use for inference,
+    this will require more memory as  and some initial setup time. However this can be much faster
     for inf. evals that require generating many tokens
     """
 
@@ -426,7 +426,7 @@ class ContextParallelRotateMethod(StrEnum):
     """
     Use all-to-all to exchange kv shards.
     """
-    
+
     def __str__(self):
         return self.value
 
@@ -516,7 +516,7 @@ class TrainConfig(BaseConfig):
 
     run_name: Optional[str] = None
     """
-    Run name, used when logging 
+    Run name, used when logging
     """
 
     model: BaseModelConfig = omegaconf.MISSING
@@ -552,6 +552,12 @@ class TrainConfig(BaseConfig):
     ft_vit: bool = True
     """
     Tune the image encoder parameters
+    """
+
+    lora_config_llm: Optional[Dict] = None
+    lora_config_vit: Optional[Dict] = None
+    """
+    LoRA configuration for both LLM and ViT
     """
 
     ft_connector: bool = True
@@ -747,7 +753,7 @@ class TrainConfig(BaseConfig):
 
     beaker_log_interval: int = 50
     """
-    How often to update beaker description with run progress 
+    How often to update beaker description with run progress
     """
 
     speed_monitor: SpeedMonitorConfig = field(default_factory=SpeedMonitorConfig)
@@ -862,7 +868,7 @@ class TrainConfig(BaseConfig):
 
     runtime_data: Optional[RuntimeData] = None
     """
-    Data about the current run, filled in automatically 
+    Data about the current run, filled in automatically
     """
 
     inf_eval_config: InfEvalConfig = field(default_factory=InfEvalConfig)

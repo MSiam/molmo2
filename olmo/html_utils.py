@@ -66,20 +66,20 @@ def escape_html(text):
 def get_frame_coordinates_in_collage(x_orig, y_orig, orig_width, orig_height, target_size=128):
     """
     Transform coordinates from original image to resized image with padding.
-    
+
     Args:
         x_orig: X coordinate in original image
         y_orig: Y coordinate in original image
-        orig_width: Original image width 
-        orig_height: Original image height 
+        orig_width: Original image width
+        orig_height: Original image height
         target_size: Target square size (default: 128)
-    
+
     Returns:
         tuple: (x_new, y_new) coordinates in the resized image
     """
     # Calculate aspect ratio
     aspect_ratio = orig_width / orig_height
-    
+
     # Determine new dimensions maintaining aspect ratio
     if orig_width > orig_height:
         # Width is limiting dimension
@@ -93,15 +93,15 @@ def get_frame_coordinates_in_collage(x_orig, y_orig, orig_width, orig_height, ta
         new_width = int(target_size * aspect_ratio)
         pad_x = (target_size - new_width) // 2
         pad_y = 0
-    
+
     # Calculate scale factors
     scale_x = new_width / orig_width
     scale_y = new_height / orig_height
-    
+
     # Transform coordinates
     x_new = x_orig * scale_x + pad_x
     y_new = y_orig * scale_y + pad_y
-    
+
     return (x_new, y_new)
 
 
@@ -137,25 +137,25 @@ def get_image_collage_coords_from_video_points(vid_points, video_w, video_h, fps
 
 def get_fps_from_text(text):
     """Extract fps from video point text based on timestamp intervals
-    
+
     Args:
         text: The text containing video points with timestamps (0.0 to 1.0)
-        
+
     Returns:
         int: The fps value inferred from number of frames in 1 second
     """
     # Find all timestamps
     timestamps = re.findall(r'\b(\d+\.\d+)\s+<im_start>', text)
-    
+
     if not timestamps:
         return 2  # Default fps
-    
+
     # Convert to floats and filter to only 0.0 to 1.0 range
     timestamps_in_range = [float(t) for t in timestamps if float(t) < 1.0]
-    
+
     # Number of unique frames in 1 second = fps
     fps = len(set(timestamps_in_range))
-    
+
     return max(1, fps)  # Ensure at least 1 fps
 
 
@@ -216,7 +216,7 @@ def build_image_asset(image_src, src_folder=None):
         logging.info(f"Adding {image_file} to asset cache")
         with open(image_file, 'wb') as f:
             f.write(image_bytes)
-    return f"/assets/{image_key}"
+    return image_file #f"/assets/{image_key}"
 
 
 def example_to_html_dict(ex, preprocessor, show_patches=False, show_crops=False, asset_cache=None):
@@ -342,7 +342,7 @@ def example_to_html_dict(ex, preprocessor, show_patches=False, show_crops=False,
             image_cells = []
             for frame_ix, boxes in sorted(frame_to_boxe.items(), key=lambda x: x[0]):
                 frame = video_frames.frames[frame_ix]
-                image_src = build_image_asset(frame, "/data/chrisc/viz")
+                image_src = build_image_asset(frame, "/media/ivulab/alkhwarizmi1/asset_cache/")
                 image_cells.append(get_html_image_with_boxes(image_src, boxes, max_dim=288, img_size=[w, h]))
             out["points"] = "\n".join(image_cells)
     elif "image" in metadata:

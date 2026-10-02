@@ -5,7 +5,12 @@ from os.path import join
 from typing import List
 import numpy as np
 from omegaconf import OmegaConf, omegaconf
+import os
+import torch
+import yaml
+import torch.distributed.checkpoint as dist_cp
 
+from transformers import AutoModelForImageTextToText, AutoConfig
 from olmo.data.data_loader import WeightedDataset, KwargsMixture, DataLoaderConfig
 from olmo.data.dynamic_packer import PackingConfig
 from olmo.eval.eval_utils import get_evaluation
@@ -285,7 +290,59 @@ def get_model(checkpoint, model):
 
 
 def get_training_mixture(name):
-    if name == "debug":
+    if name == "refvos_mocentric":
+        training_mixture = [
+            ["ground", [
+                "mevis_ground",
+                "mocentric_mevis_ground",
+                "revos_ground",
+                ], 0.5
+            ],
+            ["track", [
+                "mevis_track",
+                "ref_yt_vos_track",
+                "revos_track",
+                ], 0.5
+            ]
+        ]
+    elif name == "refvos":
+        training_mixture = [
+            ["ground", [
+                "mevis_ground",
+                "revos_ground",
+                ], 0.5
+            ],
+            ["track", [
+                "mevis_track",
+                "ref_yt_vos_track",
+                "revos_track",
+                ], 0.5
+            ]
+        ]
+    elif name == "mevis_gr":
+        training_mixture = [
+            ["ground", [
+                "mevis_ground",
+                ], 1.0
+            ],
+        ]
+    elif name == "mevis_gr_mocentric_only":
+        training_mixture = [
+            ["ground", [
+                "mevis_ground_mocentric",
+                ], 1.0
+            ],
+        ]
+    elif name == "mevis_gr_mocentric":
+        training_mixture = [
+            ["ground", [
+                "mevis_ground",
+                "mevis_ground_mocentric",
+                ], 1.0
+            ],
+        ]
+
+    elif name == "debug":
         hardcode_weight = 0.001
         training_mixture = [
             ["demo", ["pixmo_ask_model_anything"], 0.10],
@@ -438,7 +495,11 @@ def main():
     parser = argparse.ArgumentParser(prog="Train a multitask model")
     parser.add_argument("checkpoint", help="Path to checkpoint to start from")
     parser.add_argument("mixture", default="0.0.1")
+    parser.add_argument("--save_folder", type=str)
+    parser.add_argument("--hf_ckpt_load", action="store_true")
+    parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--lora", type=str, default="")
     parser.add_argument("--model", default="video")
     parser.add_argument("--seq_len", type=int, default=16384)
     parser.add_argument("--device_batch_size", default=2, type=int)
@@ -447,11 +508,15 @@ def main():
     parser.add_argument("--prefetch_factor", default=4, type=int)
     parser.add_argument("--num_workers", default=6, type=int)
     parser.add_argument("--cp_degree", default=1, type=int)
+    parser.add_argument("--n_iterations", default=3000, type=int)
     args, other_args = parser.parse_known_args()
 
     if args.mixture == "debug":
         loss_eval_tasks = ["llava_video_oe_academic", "pixmo_ask_model_anything"]
         eval_tasks = ["chart_qa", "mvbench", "mevis_track_eval_1fps:test"]
+    elif args.mixture in ["mevis_gr", "mevis_gr_mocentric_only", "mevis_gr_mocentric", "refvos", "refvos_mocentric"]:
+        eval_tasks = ["mevis_track_eval_1fps:test"]
+        loss_eval_tasks = []
     elif args.mixture.startswith("pointing"):
         loss_eval_tasks = []
         eval_tasks = ["pointing_eval_v2:test", "vixmo_points_count:val", "pixmo_count_counting:validation"]
@@ -476,6 +541,27 @@ def main():
 
     training_mixture = get_training_mixture(args.mixture)
     seq_len = args.seq_len
+
+    if args.hf_ckpt_load:
+        # I ended up not need it for the LoRA tuning keeping it for debugging
+        default_checkpoint = "./default_ckpt"
+        os.makedirs(default_checkpoint, exist_ok=True)
+
+        if not os.path.exists(args.checkpoint):
+            # It still is a huggingface model convert to pt and yaml files
+            model_cfg = AutoConfig.from_pretrained(args.checkpoint, trust_remote_code=True, local_files_only=True)
+            model = AutoModelForImageTextToText.from_pretrained(
+                args.checkpoint,
+                trust_remote_code=True,
+                dtype="bfloat16",
+                device_map="auto",
+                local_files_only=True
+            )
+            state_dict = {"model": model.state_dict()}
+            dist_cp.save(state_dict=state_dict, checkpoint_id="default_ckpt/hf_saved/step2000/")
+            #torch.save(state_dict, os.path.join(default_checkpoint, "model.pt"))
+
+        args.checkpoint = default_checkpoint
 
     checkpoint = select_checkpoint(args.checkpoint)
     model_cfg = get_model(checkpoint, args.model)
@@ -504,7 +590,7 @@ def main():
         evaluation = get_evaluation(
             task,
             None,
-            device_batch_size=args.device_batch_size*2,
+            device_batch_size=args.device_batch_size,
             max_examples=args.max_inf_eval_examples,
             num_workers=num_workers,
         )
@@ -530,18 +616,28 @@ def main():
         evaluation.data.prefetch_factor = args.prefetch_factor
         loss_evaluations.append(evaluation)
 
+    lora_config_llm = None
+    lora_config_vit = None
+    if args.lora != '':
+        if args.lora == 'llm':
+            lora_config_llm = {'r':64, 'lora_alpha':128, 'lora_dropout':0.05, 'bias':'none', 'task_type':'CAUSAL_LM'}
+        elif args.lora == 'vit':
+            lora_config_vit = {'r':32, 'lora_alpha':64, 'lora_dropout':0.05, 'bias':'none', 'task_type':None}#, 'init_lora_weights': False}#'FEATURE_EXTRACTION'}
+        else:
+            raise Exception("LoRA Type not supported")
+
     log_interval = 1 if args.debug else 20
     cfg = TrainConfig(
         run_name="multitask_train",
-        save_folder=omegaconf.MISSING,
+        save_folder=args.save_folder,#omegaconf.MISSING,#args.save_folder,
         seed=6198,
         dry_run=False,
 
-        wandb=None if args.debug else WandbConfig(
+        wandb=None if args.debug or args.no_wandb else WandbConfig(
             name="${run_name}",
-            project="${oc.env:WANDB_PROJECT}",
+            project="mocentric_molmo2",#"${oc.env:WANDB_PROJECT}",
             group=None,
-            entity="${oc.env:WANDB_ENTITY}",
+            entity="remotems25-ro-ya-community",#"${oc.env:WANDB_ENTITY}",
             log_interval=log_interval,
             allow_resume=False,
             finish_on_sigterm=True
@@ -563,12 +659,14 @@ def main():
             pin_memory=True,
             prefetch_factor=args.prefetch_factor,
             seed=50189,
-            packing=PackingConfig(buffer_size=48, image_weight=30, shortcut_max_len_images=False,
-                                  cp_world_size=args.cp_degree)
+            packing=None#PackingConfig(buffer_size=48, image_weight=30, shortcut_max_len_images=False,
+                        #          cp_world_size=args.cp_degree)
         ),
         ft_connector=True,
-        ft_llm=not args.debug,
-        ft_vit=not args.debug,
+        ft_llm=not args.debug and args.lora == '',
+        ft_vit=not args.debug and args.lora == '',
+        lora_config_llm=lora_config_llm,
+        lora_config_vit=lora_config_vit,
         optimizer=OptimizerConfig(
             name=OptimizerType.adamw,
             connector_learning_rate=5e-6,
@@ -590,10 +688,10 @@ def main():
         initial_model_checkpoint=checkpoint,
         save_interval=2000,
         save_num_checkpoints_to_keep=1,
-        global_train_batch_size=get_world_size() if args.debug else 128,
+        global_train_batch_size=get_world_size() if args.debug else 1,
         device_train_microbatch_size=args.device_batch_size,
         time_limit=None,
-        max_duration=300000,
+        max_duration=args.n_iterations, #Molmo2 default: 300000, MeVIS: 23051 examples
         stop_at="${max_duration}",
         max_grad_norm=1,
         batch_divisor=BatchDivisor.global_batch,
@@ -613,7 +711,6 @@ def main():
     )
 
     cfg.parallelism.context_parallel_config.degree = args.cp_degree
-
     conf = OmegaConf.create(cfg)
     conf.merge_with_dotlist([clean_opt(arg) for arg in other_args])
     conf = OmegaConf.to_object(conf)

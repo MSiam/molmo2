@@ -32,6 +32,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+from tqdm import tqdm
 
 import torch
 import torch.distributed as dist
@@ -39,8 +40,9 @@ import torch.distributed.checkpoint as dist_cp
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
 import torch.nn as nn
 from rich.progress import track
-from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+from torch.distributed.checkpoint.default_planner import DefaultSavePlanner, DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
+#from torch.distributed.checkpoint.optimizer import DefaultLoadPlanner
 
 from olmo.config import StrEnum
 from olmo.io import PathOrStr, normalize_path, clear_directory, dir_is_empty, is_url
@@ -191,6 +193,7 @@ def load_model_and_optim_state(
     pre_download: bool = False,
     work_dir: Optional[PathOrStr] = None,
     thread_count: Optional[int] = None,
+    lora_allow_missing_keys: bool = False
 ):
     """
     Load model and optimizer state in-place from a checkpoint saved via :func:`save_model_and_optim_state()`.
@@ -232,9 +235,11 @@ def load_model_and_optim_state(
     """
     dir = normalize_path(dir)
     state_dict = _prepare_state_dict(model, optim, process_group=process_group)
-    reader = RemoteFileSystemReader(
-        dir, thread_count=thread_count, pre_download=pre_download, work_dir=work_dir
-    )
+    if lora_allow_missing_keys:
+        state_dict = {'model': {k: v for k, v in state_dict['model'].items() if 'lora' not in k}}
+    reader = dist_cp.FileSystemReader(dir)#RemoteFileSystemReader(
+#        dir, thread_count=thread_count, pre_download=pre_download, work_dir=work_dir
+#    )
     metadata = reader.read_metadata()
 
     model_key_list = list(state_dict['model'].keys())
@@ -280,12 +285,17 @@ def load_model_and_optim_state(
         if f"model.{model_key}" not in metadata.state_dict_metadata:
             skipped_modules[model_key] = state_dict['model'].pop(model_key)
 
+    planner = DefaultLoadPlanner()
+    pbar = tqdm(desc="Loading Checkpoint", unit="tensor")
+    planner.commit_tensor = lambda read_item, tensor: (pbar.update(1), DefaultLoadPlanner.commit_tensor(planner, read_item, tensor))[1]
     dist_cp.load(
         state_dict,
         checkpoint_id=dir,
         storage_reader=reader,
         process_group=process_group,
+        planner=planner
     )
+    pbar.close()
 
     if len(skipped_modules) > 0:
         for key in ["vision_backbone.pad_embed"]:
@@ -373,13 +383,13 @@ def load_model_and_optim_state(
                     break
 
     dist_cp_sd.set_model_state_dict(
-        model, state_dict["model"], options=dist_cp_sd.StateDictOptions(strict=True)
+        model, state_dict["model"], options=dist_cp_sd.StateDictOptions(strict=not lora_allow_missing_keys)
     )
     gc_cuda()
 
-    if optim is not None:
+    if optim is not None and 'optim' in state_dict:
         dist_cp_sd.set_optimizer_state_dict(
-            model, optim, state_dict["optim"], options=dist_cp_sd.StateDictOptions(strict=True)
+            model, optim, state_dict["optim"], options=dist_cp_sd.StateDictOptions(strict=not lora_allow_missing_keys)
         )
         gc_cuda()
 

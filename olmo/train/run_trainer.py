@@ -10,13 +10,19 @@ import time
 from datetime import datetime
 from os.path import join
 from pathlib import Path
+#from torchao.quantization import int8_weight_only, quantize_, int8_dynamic_activation_int8_weight
+#from torchao.quantization import Int8WeightOnlyConfig
+#from torchao.quantization.qat import IntXQuantizationAwareTrainingConfig, FakeQuantizeConfig
+#from torch.distributed.tensor import DTensor
 
 import torch
 import wandb
 from beaker import Beaker
 from omegaconf import OmegaConf
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from wandb.sdk.wandb_run import Run
+from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
 
 from olmo.exceptions import OLMoCliError, OLMoConfigurationError
 from olmo.io import file_exists, write_file
@@ -42,9 +48,31 @@ from olmo.util import (
     log_extra_field,
     prepare_torchrun_environment,
 )
+from ..util import find_all_linear_names
 
 log = logging.getLogger("train")
 
+def prepare_llm_for_lora(lora_config,
+                         model,
+                         use_activation_checkpointing=True):
+    lora_config = LoraConfig(**lora_config)
+    model.transformer = prepare_model_for_kbit_training(
+        model.transformer, use_activation_checkpointing)
+    if lora_config.target_modules is None:
+        modules = find_all_linear_names(model.transformer)
+        lora_config.target_modules = modules
+    model.transformer = get_peft_model(model.transformer,
+                                          lora_config)
+    return model
+
+def prepare_visual_encoder_for_lora(lora_config, model):
+    lora_config = LoraConfig(**lora_config)
+    if lora_config.target_modules is None:
+        modules = find_all_linear_names(model.vision_backbone)
+        lora_config.target_modules = modules
+    model.vision_backbone = get_peft_model(model.vision_backbone,
+                                             lora_config)
+    return model
 
 def run_trainer(cfg: TrainConfig) -> None:
     if cfg.run_name is None:
@@ -108,9 +136,13 @@ def run_trainer(cfg: TrainConfig) -> None:
 
     # Init the model
     model_cfg = cfg.model
-    with torch.device("meta"):
+    with torch.device("cuda"):
         olmo_model = model_cfg.build_model()
 
+    # I stopped at issues with quantizing a moedl with biases, biases are not supported so I have to do it manually not through quantize_
+    #base_quant_config = FakeQuantizeConfig(torch.int8, granularity="per_group", is_symmetric=True, group_size=128)
+    #qat_config = IntXQuantizationAwareTrainingConfig(activation_config=None, weight_config=base_quant_config)
+    #quantize_(olmo_model, qat_config)
     # Freeze parameters depending on what we are tuning
     if not cfg.ft_connector:
         log.info(f"Freezing connector")
@@ -150,6 +182,12 @@ def run_trainer(cfg: TrainConfig) -> None:
     # Do some other model setup
     if cfg.activation_checkpointing:
         olmo_model.apply_activation_checkpointing()
+
+    if cfg.lora_config_llm:
+        olmo_model = prepare_llm_for_lora(cfg.lora_config_llm, olmo_model)
+
+    if cfg.lora_config_vit:
+        olmo_model = prepare_visual_encoder_for_lora(cfg.lora_config_vit, olmo_model)
     # Stops the compiler get confused due to cache modifications
     olmo_model.warmup_cache(device, cp_enabled=cp_enabled)
 
@@ -157,6 +195,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         assert cfg.parallelism.context_parallel_config.degree == 1, "Model compilation is not supported with context parallelism yet."
         olmo_model.apply_compile(**cfg.compile.compile_args())
 
+    print([name for name, p in olmo_model.named_parameters() if p.requires_grad])
     world_mesh = None
     if not cp_enabled:
         # Shard the model, and initialize if we are not loading a checkpoint
@@ -177,7 +216,6 @@ def run_trainer(cfg: TrainConfig) -> None:
             # or going to load a checkpoint anyway
             def dummy_init_fn(module: torch.nn.Module) -> None:
                 module.to_empty(device=device, recurse=False)
-
             fsdp_model = FSDP(
                 olmo_model,
                 **cfg.fsdp.get_fsd_args(cfg.autocast_precision),
@@ -190,9 +228,9 @@ def run_trainer(cfg: TrainConfig) -> None:
         elif cfg.fsdp.fsdp2:
             log.info("Wrapping model with FSDP2...")
             olmo_model.apply_fsdp2(**cfg.fsdp.get_fsd2_args(cfg.autocast_precision))
-            olmo_model.to_empty(device=device)
-            if start_from is None:
-                olmo_model.reset_with_pretrained_weights()
+#            olmo_model.to_empty(device=device) # I removed it because it was overriding LoRA weights init
+#            if start_from is None:
+#                olmo_model.reset_with_pretrained_weights()
             fsdp_model = olmo_model
         else:
             raise NotImplementedError()
@@ -216,7 +254,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         if start_from is None:
             olmo_model.reset_with_pretrained_weights()
         fsdp_model = olmo_model
- 
+
     torch.cuda.empty_cache()
 
     log.info(f"Total number of parameters: {olmo_model.num_params():,d}")
@@ -234,22 +272,22 @@ def run_trainer(cfg: TrainConfig) -> None:
 
     # Construct data loader and evaluators
     train_loader = cfg.data.build_train_dataloader(
-        model_config=cfg.model, 
-        mesh=world_mesh, 
-        global_batch_size=cfg.global_train_batch_size, 
+        model_config=cfg.model,
+        mesh=world_mesh,
+        global_batch_size=cfg.global_train_batch_size,
     )
     if cfg.eval_interval > 0 or cfg.eval_on_load:
         evaluators = [v.build_dataset_evaluator(
-            model_config=cfg.model, 
+            model_config=cfg.model,
             mesh=world_mesh,
             device=device) for v in cfg.evaluators]
     else:
         evaluators = None
     if cfg.inf_eval_interval > 0 or cfg.eval_on_load:
         inf_evaluators = [v.build_dataset_evaluator(
-            model_config=cfg.model, 
+            model_config=cfg.model,
             mesh=None,  # disable mesh for inference as it's not supported
-            default_save_dir=None, 
+            default_save_dir=None,
             device=device) for v in cfg.inf_evaluators]
     else:
         inf_evaluators = None
@@ -303,7 +341,8 @@ def run_trainer(cfg: TrainConfig) -> None:
             resume_from=resume_from,
             settings=wandb.Settings(init_timeout=180)
         )
-        wandb_url = wandb.run.get_url()
+        #wandb_url = wandb.run.get_url()
+        wandb_url = wandb.run.url
         if beaker_logger is not None:
             beaker_logger.add_wandb(wandb_url)  # add wandb url to beaker description
 
@@ -334,7 +373,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         beaker_experiment_id=os.environ.get("BEAKER_EXPERIMENT_ID"),
         beaker_experiment_url=(None if beaker_logger is None else
                                beaker_logger.get_beaker_url()),
-        wandb_url=wandb.run.get_url() if wandb.run else None,
+        wandb_url=wandb.run.url if wandb.run else None,
         wandb_id=wandb.run.id if wandb.run else None,
         args=" ".join(sys.argv),
         resuming_from=start_from if is_resuming else None,
@@ -382,13 +421,17 @@ def run_trainer(cfg: TrainConfig) -> None:
                     start_from,
                     load_optimizer_state=not reset_opt,
                     load_trainer_state=not reset_train,
+                    lora_allow_missing_keys=not cfg.lora_config_llm is None or not cfg.lora_config_vit is None
                 )
             log.info(f"Checkpoint successfully loaded in {time.perf_counter()-t0:0.1f} seconds")
             barrier()
 
+        fsdp_model = fsdp_model.to(cfg.autocast_precision)
+
         for name, param in fsdp_model.named_parameters():
             if not torch.all(torch.isfinite(param)):
                 raise ValueError(name)
+        torch.cuda.empty_cache()
 
         # Ready to start training
         if not cfg.dry_run:

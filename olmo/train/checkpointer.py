@@ -83,7 +83,8 @@ def is_unsharded_checkoint(dir: PathOrStr) -> bool:
     return file_exists(join(dir, MODEL_FILENAME))
 
 
-def load_model_state(dir: PathOrStr, model: nn.Module, cfg: CheckpointerConfig = None):
+def load_model_state(dir: PathOrStr, model: nn.Module, cfg: CheckpointerConfig = None,
+                     lora_allow_missing_keys: bool = False):
     """
     Load model state in-place from `dir`
 
@@ -99,7 +100,8 @@ def load_model_state(dir: PathOrStr, model: nn.Module, cfg: CheckpointerConfig =
             dir, model,
             optim=None,
             load_optimizer_state=False,
-            load_trainer_state=False
+            load_trainer_state=False,
+            lora_allow_missing_keys=lora_allow_missing_keys
         )
     log.info(f"Done in {time.perf_counter()-t0:0.1f} seconds")
 
@@ -210,6 +212,7 @@ class Checkpointer:
         load_optimizer_state: Optional[bool] = None,
         load_trainer_state: Optional[bool] = None,
         key_mapping: Optional[Dict[str, str]] = None,
+        lora_allow_missing_keys: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Load model, optim, and other training state from a local or remote checkpoint directory
@@ -224,7 +227,7 @@ class Checkpointer:
             # doesn't exist, which can happen when we're restoring a checkpoint with a different world size.
             for path in (f"{dir}/train/rank{get_global_rank()}.pt", f"{dir}/train/rank0.pt"):
                 try:
-                    trainer_state = torch.load(cached_path(path, quiet=True), weights_only=False)
+                    trainer_state = torch.load(cached_path(path, quiet=True), weights_only=False, map_location="cuda:0")
                     break
                 except FileNotFoundError:
                     pass
@@ -243,6 +246,7 @@ class Checkpointer:
             pre_download=is_url(dir) and self.pre_download,
             work_dir=self.work_dir,
             thread_count=self.load_thread_count,
+            lora_allow_missing_keys=lora_allow_missing_keys
         )
         return trainer_state
 

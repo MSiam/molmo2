@@ -13,6 +13,8 @@ import torchmetrics
 import wandb
 from tqdm import tqdm
 
+import torch._dynamo
+
 from .evaluators import (
     HtmlTable, CountEval, PointCountEval, ClockEval, VqaEval,
     SavePredictions, MathVistaEval, PointingEval,
@@ -230,7 +232,7 @@ class EvaluatorConfig(BaseConfig):
     video_single_point_prediction: str='' # path with single point predicitons
     video_point_tracking_eval: str = ''
     """Video pointing task name to run evaluation on (e.g., 'mevis_point_track_per_frame_fps_6_sample_fps_1')"""
-    
+
     """Whether to run RefExp evaluation"""
     refexp_eval: bool = False
     """Whether to run COCO captioning evaluation, use CIDEr score"""
@@ -374,7 +376,15 @@ class InfDatasetEvaluator:
         predictions = defaultdict(list)
         done_init = False
         tok = model.config.build_tokenizer()
-        pbar = pbar and get_global_rank() == 0
+        pbar = True #pbar and get_global_rank() == 0
+#        import pdb; pdb.set_trace()
+#        if 'fsdp' in str(type(model)):
+#            saved_pre_hooks = dict(model._forward_pre_hooks)
+#            saved_post_hooks = dict(model._forward_hooks)
+#            model._forward_pre_hooks.clear()
+#            model._forward_hooks.clear()
+#            is_distributed = False
+#
         for eval_step, batch in enumerate(tqdm(eval_it, total=total_steps, ncols=100, disable=not pbar)):
             if logger and eval_step % logger.log_interval == 0:
                 logger.log_evaluation(self.label, eval_step, total_steps)
@@ -392,16 +402,20 @@ class InfDatasetEvaluator:
                         else:
                             converted[k] = v[i].tolist()
                     batch_metadata.append(converted)
+
             batch_inference = move_to_device(batch, device)
             with torch.inference_mode():
+                # Forcing is_distributed to False speeds up the inference and I am only running on a single GPU
                 with torch.autocast("cuda", enabled=True, dtype=autocast_precision):
                     olmo_gen_output = model.generate(
                         batch=batch_inference,
                         max_steps=self.max_new_tokens,
                         sampler=sampler,
                         constraints=constraints,
-                        is_distributed=is_distributed
+                        is_distributed=False
+                        #is_distributed=is_distributed
                     )
+
             input_tokens = olmo_gen_output.token_ids[:, 0].detach().cpu().numpy()
             prompt_tokens = batch_inference["input_ids"].detach().cpu().numpy()
             prediction_text = [tok.decode(x[x >= 0]) for x in input_tokens]
@@ -433,6 +447,10 @@ class InfDatasetEvaluator:
         if logger:
             logger.log_evaluation(self.label, total_steps, total_steps)
         metrics = self.evaluator(predictions, all_metadata, tokenizer, device)
+
+#        if 'fsdp' in str(type(model)):
+#            model._forward_pre_hooks.update(saved_pre_hooks)
+#            model._forward_hooks.update(saved_post_hooks)
         return metrics
 
 
@@ -484,7 +502,6 @@ class InfDatasetEvaluatorConfig(BaseConfig):
             max_steps = self.subset_num_batches
         else:
             max_steps = None
-
         eval_loader = self.data.build_eval_dataloader(
             model_config=model_config,
             batch_size=self.device_batch_size,
