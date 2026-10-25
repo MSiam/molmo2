@@ -596,8 +596,8 @@ class Trainer:
     def restore_rng_state(self, rng_state: Dict[str, Any]) -> None:
         random.setstate(rng_state["python"])
         np.random.set_state(rng_state["numpy"])
-        torch.set_rng_state(rng_state["torch"])
-        torch.cuda.set_rng_state(rng_state["cuda"])
+        torch.set_rng_state(rng_state["torch"].cpu())
+        torch.cuda.set_rng_state(rng_state["cuda"].cpu())
 
     def save_checkpoint(self, checkpoint_type: CheckpointType, optim=True) -> Tuple[PathOrStr, Optional[PathOrStr]]:
         if checkpoint_type == CheckpointType.sharded:
@@ -645,13 +645,13 @@ class Trainer:
         local_cache: Optional[PathOrStr] = None,
         load_optimizer_state: bool = True,
         load_trainer_state: bool = True,
-        allow_missing_keys: bool = False
+        lora_allow_missing_keys: bool = False
     ):
         trainer_state = self.checkpointer.load(
             load_path, self.fsdp_model, self.optim,
             load_optimizer_state=load_optimizer_state,
             load_trainer_state=load_trainer_state,
-            # allow_missing_keys=allow_missing_keys
+            lora_allow_missing_keys=lora_allow_missing_keys
         )
         if load_trainer_state:
             self.load_trainer_state_dict(trainer_state)
@@ -710,7 +710,6 @@ class Trainer:
 
         # need to pass loss_masks and labels to model when using cp_degree > 1 in order to chunk them across cp ranks
         keys_to_exclude = ["loss_masks", "labels"] if not self.cp_enabled else []
-
         with torch.autocast("cuda", dtype=self.cfg.autocast_precision):
             model_out = self.fsdp_model(
                 **{k: v for k, v in batch.items() if k not in keys_to_exclude},
@@ -1268,7 +1267,7 @@ class Trainer:
                     metrics = self.train_step(batch, compute_metrics=should_log_this_step)
 
                     # Maybe collect other metrics.
-                    if should_log_this_step:
+                    if should_log_this_step:#.to(torch.float32):
                         metrics.update(speed_monitor.check())
                         metrics.update(self.system_metrics())
                         metrics.update(batch_monitor.check(self.device))
@@ -1299,7 +1298,7 @@ class Trainer:
                         and self.cfg.wandb is not None
                         and self.global_step % self.cfg.wandb.log_interval == 0
                     ):
-                        wandb.log(metrics, step=self.global_step)
+                        wandb.log(metrics, step=self.global_step, commit=False)
 
                     # Check if/when run should be canceled.
                     if not cancel_initiated and self.global_step % self.cfg.canceled_check_interval == 0:
@@ -1437,7 +1436,7 @@ class Trainer:
         if wandb.run is not None:
             if exit_code != 0:
                 log.info(f"Finishing wandb with exit code {exit_code}")
-            wandb.finish(exit_code=exit_code, quiet=True)
+            wandb.finish(exit_code=exit_code)
         gc_cuda()
         if self._gc_init_state:
             gc.enable()

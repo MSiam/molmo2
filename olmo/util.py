@@ -10,6 +10,7 @@ import math
 import threading
 import uuid
 
+import torch.nn as nn
 import torch.multiprocessing as mp
 import time
 import warnings
@@ -26,6 +27,8 @@ from rich.highlighter import NullHighlighter
 from rich.progress import Progress
 from rich.text import Text
 from rich.traceback import Traceback
+
+from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
 
 from .config import StrEnum
 from .exceptions import (
@@ -44,7 +47,6 @@ except ImportError:
 
 
 OLMO_NUM_THREADS_ENV_VAR = "OLMO_NUM_THREADS"
-
 
 def ensure_multiple_of(x: int, of: int) -> int:
     return of * math.ceil(x / of)
@@ -601,6 +603,41 @@ def generate_uuid() -> str:
     Generate a unique ID.
     """
     return str(uuid.uuid4())
+
+def find_all_linear_names(model):
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    if 'output_layer' in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove('output_layer')
+    return list(lora_module_names)
+
+def prepare_llm_for_lora(lora_config,
+                         model,
+                         use_activation_checkpointing=True):
+    lora_config = LoraConfig(**lora_config)
+    model.transformer = prepare_model_for_kbit_training(
+        model.transformer, use_activation_checkpointing)
+    if lora_config.target_modules is None:
+        modules = find_all_linear_names(model.transformer)
+        lora_config.target_modules = modules
+    model.transformer = get_peft_model(model.transformer,
+                                          lora_config)
+    return model
+
+def prepare_visual_encoder_for_lora(lora_config, model):
+    lora_config = LoraConfig(**lora_config)
+    if lora_config.target_modules is None:
+        modules = find_all_linear_names(model.vision_backbone.image_vit)
+        lora_config.target_modules = modules
+    model.vision_backbone.image_vit = get_peft_model(model.vision_backbone.image_vit,
+                                                     lora_config)
+    return model
 
 
 def select_checkpoint(checkpoint, prefer_unsharded=False, quiet=False):

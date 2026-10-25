@@ -202,7 +202,7 @@ def convert_config(
         ]:
             if getattr(llm_config, key) is not None:
                 rope_scaling[key[len("rope_"):]] = getattr(llm_config, key)
-    
+
     max_position_embeddings = llm_config.max_position_embeddings or llm_config.max_sequence_length
     if override_max_model_len is not None:
         max_position_embeddings = override_max_model_len
@@ -284,10 +284,10 @@ def convert_lm_head_and_prefix(
         else:
             new_key = f"{base_model_prefix}.{key}"
         new_state_dict[new_key] = val
-    
+
     if weight_tying:
         new_state_dict["lm_head.weight"] = state_dict["transformer.wte.embedding"]
-    
+
     return new_state_dict
 
 
@@ -309,16 +309,16 @@ def convert_molmo2(
             move_to_attn.append("att_proj.bias")
         if use_qk_norm:
             move_to_attn += ["q_norm.weight", "k_norm.weight"]
-        
+
         for k in move_to_attn:
             assert f"{prefix}.self_attn.{k}" not in new_state_dict
             new_state_dict[f"{prefix}.self_attn.{k}"] = new_state_dict.pop(f"{prefix}.{k}")
-        
+
         move_to_mlp = ["ff_proj.weight", "ff_out.weight"]
         for k in move_to_mlp:
             assert f"{prefix}.mlp.{k}" not in new_state_dict
             new_state_dict[f"{prefix}.mlp.{k}"] = new_state_dict.pop(f"{prefix}.{k}")
-    
+
     return new_state_dict
 
 
@@ -327,22 +327,27 @@ def convert_model(
     model_config: ModelConfig,
     hf_config: Molmo2Config,
     use_bfloat16: bool,
+    lora: str = ""
 ) -> Molmo2ForConditionalGeneration:
     """Convert model to HF-compatible model"""
     with torch.device("meta"):
         model = model_config.build_model()
         hf_model = Molmo2ForConditionalGeneration(hf_config)
-    model.to_empty(device=torch.device("cpu"))
-    hf_model.to_empty(device=torch.device("cpu"))
-
+    model.to_empty(device=torch.device("cuda"))
+    model = model.to(torch.bfloat16 if use_bfloat16 else torch.float32)
+    if lora!= "":
+        model.prepare_lora(lora)
+    torch.cuda.empty_cache()
     load_model_state(checkpoint_dir, model)
+    if lora!= "":
+        model.merge_lora(lora)
     model.eval()
-    model = model.to(torch.float32)
     state_dict = model.state_dict()
 
     new_state_dict = convert_molmo2(state_dict, hf_config, model_config.llm.weight_tying)
-    hf_model.eval()
     hf_model = hf_model.to(torch.bfloat16 if use_bfloat16 else torch.float32)
+    hf_model.to_empty(device=torch.device("cuda"))
+    hf_model.eval()
     hf_model.load_state_dict(new_state_dict)
     return hf_model
 
@@ -353,6 +358,7 @@ def save(
     use_bfloat16: bool,
     attn_implementation: str,
     override_max_model_len: Optional[int],
+    lora: Optional[str] = ""
 ) -> None:
     logger.info(f"Loading model config from {checkpoint_dir}")
     config_path = resource_path(select_checkpoint(checkpoint_dir), "config.yaml")
@@ -362,7 +368,8 @@ def save(
 
     logger.info(f"Save HF-compatible model config and checkpoint to {output_dir}")
     logger.info(f"Save HF-compatible model config and checkpoint to {output_dir}")
-    hf_model = convert_model(checkpoint_dir, model_config, hf_config, use_bfloat16)
+    hf_model = convert_model(checkpoint_dir, model_config, hf_config, use_bfloat16, lora)
+    torch.cuda.empty_cache()
 
     hf_model.save_pretrained(output_dir)
 
@@ -485,6 +492,7 @@ def main():
     parser.add_argument("checkpoint_dir", help="Location of Molmo2 checkpoint.")
     parser.add_argument("output_dir", help="Location to save the converted checkpoint.", default="./hf-ckpt")
     parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 weights")
+    parser.add_argument("--lora", type=str, default="", help="LoRA flag")
     parser.add_argument(
         "--attn_implementation", type=str, default="sdpa", help="Attention type",
         choices=["eager", "sdpa", "flash_attention_2"],
@@ -504,6 +512,7 @@ def main():
         args.use_bfloat16,
         args.attn_implementation,
         args.override_max_model_len,
+        lora=args.lora
     )
 
 

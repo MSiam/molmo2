@@ -119,6 +119,7 @@ def build_tokenizer(
                     tokenizer_type,
                     token=environ.get("HF_ACCESS_TOKEN"),
                     cache_dir=cache_dir,
+                    local_files_only=True,
                 )
                 break
             except requests.exceptions.ReadTimeout as e:
@@ -128,7 +129,7 @@ def build_tokenizer(
 
     extra_tokens = list(EXTRA_TOKENS)
     if pad_tokenizer_to is not None:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_type, token=environ.get("HF_ACCESS_TOKEN"), cache_dir=cache_dir)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_type, token=environ.get("HF_ACCESS_TOKEN"), cache_dir=cache_dir, local_files_only=True)
         assert len(tokenizer) <= pad_tokenizer_to
         n_extra_tokens = pad_tokenizer_to - len(tokenizer)
         # This handles a case where the LLM embedding matrix is larger than the vocab size
@@ -145,6 +146,7 @@ def build_tokenizer(
         tokenizer_type, additional_special_tokens=extra_tokens,
         token=environ.get("HF_ACCESS_TOKEN"),
         cache_dir=cache_dir,
+        local_files_only=True
     )
     if tokenizer.bos_token_id is None:
         # These tokenizers do not have a BOS, and instead use EOS as a generic seperator token.

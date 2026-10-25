@@ -403,9 +403,14 @@ class RemoteFileSystemReader(dist_cp.StorageReader):
                 planner.load_bytes(read_item, bytes)
             else:
                 # NOTE: 'weights_only=False' needed to load torchao's float8 linear layer checkpoints
+                #tensor = cast(
+                #    torch.Tensor, torch.load(bytes, map_location="cpu", weights_only=False)
+                #)
+                ####### Changing to directly mp to GPU
                 tensor = cast(
-                    torch.Tensor, torch.load(bytes, map_location="cpu", weights_only=False)
+                        torch.Tensor, torch.load(bytes, map_location="cuda:0", weights_only=False)
                 )
+
                 tensor = _narrow_tensor_by_index(
                     tensor, read_item.storage_offsets, read_item.lengths
                 )
@@ -462,3 +467,4 @@ class RemoteFileSystemReader(dist_cp.StorageReader):
     def validate_checkpoint_id(cls, checkpoint_id: PathOrStr) -> bool:
         del checkpoint_id
         return True
+

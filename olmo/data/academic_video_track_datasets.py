@@ -69,6 +69,8 @@ import re
 from huggingface_hub import snapshot_download, hf_hub_download
 import datasets
 import zipfile
+from PIL import Image
+import matplotlib.pyplot as plt
 
 from olmo.data.dataset import Dataset, VIDEO_DATA_HOME
 from olmo.data.utils import maybe_download_and_unzip, maybe_download_file
@@ -143,7 +145,7 @@ def encode_frames_to_video(frames_dir, output_path, fps, native_fps:int=None,
     if native_fps is not None and native_fps != fps:
         subsample_factor = max(1, round(native_fps / fps))
         image_files = image_files[::subsample_factor]
-    
+
     # pro
     end_frame = end_frame + 1 if end_frame is not None else None
     image_files = image_files[start_frame:end_frame]
@@ -162,8 +164,8 @@ def encode_frames_to_video(frames_dir, output_path, fps, native_fps:int=None,
         "-safe", "0",
         "-r", str(fps),
         "-i", filelist_path,
-        "-c:v", "libopenh264",
-        "-b:v", "4M",
+#        "-c:v", "libopenh264",
+#        "-b:v", "4M",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         output_path,
@@ -286,7 +288,7 @@ class TrackingDataset(Dataset):
                         assert video_fps[key] == fps, f"Conflicting FPS for {key}: {video_fps[key]} vs {fps}"
                     video_fps[key] = fps
         return video_fps
-    
+
     @classmethod
     def _create_videos(cls, work_items, n_procs=1):
         """Convert frame dirs to videos, optionally in parallel."""
@@ -423,7 +425,6 @@ class TrackingDataset(Dataset):
         local_dir = self._get_local_dir(self.task, self.data_split)
         config = self._get_hf_config(self.task)
         data = _load_hf_dataset(self.HF_SOURCE, self.data_split, local_name=local_dir, config=config)
-
         self.data_lookup = {ex_id: i for i, ex_id in enumerate(data["id"])}
 
         if self.use_fps_sampling:
@@ -458,7 +459,7 @@ class TrackingDataset(Dataset):
 
     def _get_candidate_fps(self, video_fps):
         return get_candidate_sampling_fps(video_fps, self.sampling_fps or 1)
-    
+
     def _get_style(self):
         if self.task == "track":
             return "video_point_track_per_frame"
@@ -502,7 +503,7 @@ class TrackingDataset(Dataset):
             point_frames.sort(key=lambda x: x['frame'])
 
             message_list[0]['points'] = point_frames or None
-        
+
         return message_list
 
 
@@ -663,13 +664,21 @@ class Mevis(TrackingDataset):
             for mask_idx, anno_id in enumerate(anno_ids):
                 anno_id = str(anno_id) # mask_dict keys are strings
                 mask_annot[mask_idx] = mask_dict[anno_id]
-
             os.makedirs(join(output_dir, video_id), exist_ok=True)
             with open(query_output, 'w') as f:
                 json.dump(mask_annot, f)
             n_encoded += 1
 
         log.info(f"Precomputed GT masks: {n_encoded} new, {n_skipped} already exist, out of {len(hf_queries)} queries.")
+
+    def __init__(self, split, task, sampling_fps=None, use_fps_sampling=True):
+        super().__init__(split, task, sampling_fps, use_fps_sampling)
+        if split == "test":
+            # I added this explicitly instead of max_examples from outside
+            # Since some of the examples later on give CUDA OOM and setting max_examples auto does shuffle
+            # Temporarily till I make code more memory efficient
+            MAX_N_EXAMPLES = 10
+            self.data = self.data.select(range(MAX_N_EXAMPLES))
 
     def get(self, idx, rng):
         item = super().get(idx, rng)
@@ -684,6 +693,54 @@ class Mevis(TrackingDataset):
                 item['metadata']['mask_id'] = ex['mask_id']
                 if "points" in item['message_list'][0]:
                     item['metadata']['points'] = item['message_list'][0]['points']
+        return item
+
+class MoCentricMevis(Mevis):
+    # ToDo: Make it more efficient by generating offline all MVL videos with multiple random keyframes prior to get
+    def get(self, idx, rng):
+        item = super().get(idx, rng)
+
+        # Create the new Motion-Centric Multivideo layout video
+        video_path = item["video"]
+        left_flag = bool(np.random.randint(2))
+
+        tmp_video_path = os.path.join(os.getcwd(), 'tmp_video/')
+        if os.path.exists(tmp_video_path):
+            os.system(f'rm -rf {tmp_video_path}')
+        tmp_video_path_original = os.path.join(tmp_video_path, "original")
+        tmp_video_path_mocentric = os.path.join(tmp_video_path, "mocentric")
+
+        os.makedirs(tmp_video_path_original, exist_ok=True)
+        os.makedirs(tmp_video_path_mocentric, exist_ok=True)
+
+        extract_frames(video_path, tmp_video_path_original)
+        frames = sorted(glob(os.path.join(tmp_video_path_original, "*.jpg")))
+        keyframe = frames[np.random.randint(len(frames))]
+        keyframe_img = np.array(Image.open(keyframe))
+
+        for frame in frames:
+            img = np.array(Image.open(frame))
+            h, w = img.shape[:2]
+            if left_flag:
+                mvl_img = np.concatenate([keyframe_img, img], axis=1)
+            else:
+                mvl_img = np.concatenate([img, keyframe_img], axis=1)
+
+            cv2.imwrite(os.path.join(tmp_video_path_mocentric, frame.split('/')[-1]), mvl_img[:,:,::-1])
+
+        encode_frames_to_video(tmp_video_path_mocentric, tmp_video_path_mocentric+".mp4", fps=6)
+        item["video"] = tmp_video_path_mocentric+".mp4"
+        item['metadata']['w'] = w*2
+
+        # Modify the points for grounding to reflect this change
+        for msg_idx, _ in enumerate(item["message_list"]):
+            item["message_list"][msg_idx]['width'] = w*2
+            if left_flag:
+                for point_idx, _ in enumerate(item["message_list"][msg_idx]["points"]):
+                    for obj_idx in item["message_list"][msg_idx]["points"][point_idx]['points'].keys():
+                        pt = item["message_list"][msg_idx]["points"][point_idx]['points'][obj_idx]['point']
+                        pt[0] += w
+                        item["message_list"][msg_idx]["points"][point_idx]['points'][obj_idx]['point'] = pt
         return item
 
 class MevisChallenge(Mevis):
@@ -852,7 +909,7 @@ class RefYoutubeVOS(TrackingDataset):
                 rle = mask_utils.encode(binary)
                 rle['counts'] = rle['counts'].decode('utf-8')
                 rle_masks.append(rle)
-            
+
             assert len(mask_id) == 1
             mask_annot = {mask_id[0]: rle_masks}
             os.makedirs(join(output_dir, video_id), exist_ok=True)
@@ -1069,7 +1126,7 @@ class ReasonVOS(TrackingDataset):
             video_id = ex['video']
             query_id = ex['qid']
             obj_ids = ex['obj_id']
-            
+
             query_output = join(output_dir, video_id, f"{query_id}.json")
             if exists(query_output):
                 n_skipped += 1
@@ -1172,14 +1229,14 @@ class Burst(TrackingDataset):
         # We subsample frames every (original_fps / target_fps) frames when creating videos.
         local_dir = join(cls.LOCAL_DIR, cls.DATASET_NAME)
         hf_hub_download(
-            repo_id=cls.HF_SOURCE, 
-            filename="video_original_fps.json", 
+            repo_id=cls.HF_SOURCE,
+            filename="video_original_fps.json",
             repo_type="dataset",
             local_dir=local_dir,
         )
         with open(join(local_dir, "video_original_fps.json"), 'r') as f:
             original_video_fps: dict = json.load(f)
-        
+
         # Create videos from frames with desired FPS for all splits
         video_fps = cls._load_all_dataset_and_fps()
         work_items = []
@@ -1210,7 +1267,7 @@ class LVVIS(TrackingDataset):
     @classmethod
     def download(cls, n_procs=1):
 
-        maybe_download_file( 
+        maybe_download_file(
             cls.VIDEO_URL,
             join(cls.VIDEO_HOME, "train.zip"),
         )
@@ -1228,7 +1285,7 @@ class LVVIS(TrackingDataset):
                     zf.extract(member, cls.VIDEO_HOME)
         else:
             log.info(f"{extract_path} already exists, skipping.")
-        
+
         # Create videos from frames with desired FPS for all splits
         video_fps = cls._load_all_dataset_and_fps()
         work_items = []
@@ -1260,7 +1317,7 @@ class YTVIS(TrackingDataset):
 
     @classmethod
     def download(cls, n_procs=1):
-        
+
         # Check and unzip train.zip in VIDEO_HOME
         zip_path = join(cls.VIDEO_HOME, "train.zip")
         extract_path = join(cls.VIDEO_HOME, "train")
@@ -1274,7 +1331,7 @@ class YTVIS(TrackingDataset):
                     zf.extract(member, cls.VIDEO_HOME)
         else:
             log.info(f"{extract_path} already exists, skipping.")
-        
+
         # Create videos from frames with desired FPS for all splits
         video_fps = cls._load_all_dataset_and_fps()
         work_items = []
@@ -1324,7 +1381,7 @@ class ViCaS(TrackingDataset):
             log.warning(f"{len(failed)}/{len(work_items)} videos failed to extract, e.g.: {failed[:5]}")
         else:
             log.info(f"All {len(work_items)} videos extracted successfully.")
-    
+
     @classmethod
     def download(cls, n_procs=1):
 
@@ -1361,8 +1418,8 @@ class ViCaS(TrackingDataset):
         # We subsample frames every (original_fps / target_fps) frames when creating videos.
         local_dir = join(cls.LOCAL_DIR, cls.DATASET_NAME)
         hf_hub_download(
-            repo_id=cls.HF_SOURCE, 
-            filename="video_original_fps.json", 
+            repo_id=cls.HF_SOURCE,
+            filename="video_original_fps.json",
             repo_type="dataset",
             local_dir=local_dir,
         )
@@ -1400,7 +1457,7 @@ class ReVOS(TrackingDataset):
     1. Visit https://github.com/cilinyan/ReVOS-api and click the OneDrive link to request access.
     2. Download the "JPEGImages.zip" file and place it in the VIDEO_HOME directory (e.g. VIDEO_TRACK_DATA_HOME/ReVOS/)
 """
-    
+
     @classmethod
     def download(cls, n_procs=1):
 
@@ -1444,12 +1501,12 @@ class MoCA(TrackingDataset):
     @classmethod
     def _get_video_dir(cls, data_split):
         return join(cls.VIDEO_HOME, "videos")
-    
+
     @classmethod
     def download(cls, n_procs=1):
 
         # Download file
-        maybe_download_file( 
+        maybe_download_file(
             cls.VIDEO_URL,
             join(cls.VIDEO_HOME, "MoCA.zip"),
         )
@@ -1467,7 +1524,7 @@ class MoCA(TrackingDataset):
                     zf.extract(member, extract_path)
         else:
             log.info(f"Videos already exist, skipping extraction.")
-        
+
         # Create videos from frames with desired FPS for all splits
         video_fps = cls._load_all_dataset_and_fps()
         work_items = []
@@ -1715,7 +1772,7 @@ class TNL2K(SingleObjectTrackingDataset):
     def download(cls, n_procs=1):
         if not exists(cls.VIDEO_HOME):
             raise RuntimeError(cls.MANUAL_DOWNLOAD_INSTRUCTION)
-        
+
         # unzip
         subset_ids = ['p1', 'p2_1', 'p2_2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8', 'p9', 'p10', 'p11', 'p12', 'p13']
         for subset_id in subset_ids:
@@ -1812,7 +1869,7 @@ class WebUAV(SingleObjectTrackingDataset):
     def download(cls, n_procs=1):
         if not exists(cls.VIDEO_HOME):
             raise RuntimeError(cls.MANUAL_DOWNLOAD_INSTRUCTION)
-        
+
         # unzip
         zip_path = join(cls.VIDEO_HOME, f"Train_Single.zip")
         extract_path = join(cls.VIDEO_HOME, "Train")
@@ -1863,7 +1920,7 @@ class GOT10k(SingleObjectTrackingDataset):
     def download(cls, n_procs=1):
         if not exists(cls.VIDEO_HOME):
             raise RuntimeError(cls.MANUAL_DOWNLOAD_INSTRUCTION)
-        
+
         # unzip
         zip_path = join(cls.VIDEO_HOME, f"full_data.zip")
         extract_path = join(cls.VIDEO_HOME, "train")
@@ -1877,7 +1934,7 @@ class GOT10k(SingleObjectTrackingDataset):
                     zf.extract(member, extract_path)
         else:
             log.info(f"{extract_path} already exists, skipping.")
-        
+
         # create videos
         video_fps = cls._load_all_dataset_and_fps()
         work_items = []

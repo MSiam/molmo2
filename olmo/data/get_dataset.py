@@ -18,7 +18,7 @@ from olmo.data.academic_video_datasets import (
     TVQA, NeXTQA, CharadesSTA
 )
 from olmo.data.academic_video_track_datasets import (
-    Mevis, MevisChallenge, Burst, ReasonVOS, RefYoutubeVOS, RefDavis17,
+    Mevis, MevisChallenge, MoCentricMevis, Burst, ReasonVOS, RefYoutubeVOS, RefDavis17,
     LVVIS, YTVIS, ViCaS, ReVOS, MoCA,
     LVOSv1, LVOSv2, LaSOT, UWCOT, WebUOT, LaTOT, TNL2K, TNLLT,
     WebUAV, GOT10k, VastTrack, TrackingNet
@@ -408,7 +408,7 @@ def get_dataset_by_name(dataset_name, split) -> Dataset:
         return CharadesSTA(split=split, task="all")
     if dataset_name == "charades_sta_all_qa":
         return CharadesSTA(split=split, task="all", qa_format=True)
-    #### 
+    ####
     # Academic video object tracking datasets
     # mevis: track, ground, single_point_track
     if dataset_name == "mevis_track": # Uses [1,2] sampling fps by default.
@@ -419,6 +419,8 @@ def get_dataset_by_name(dataset_name, split) -> Dataset:
         return Mevis(split=split, task="track", sampling_fps=2)
     if dataset_name == "mevis_ground":
         return Mevis(split=split, task="ground")
+    if dataset_name == "mocentric_mevis_ground":
+        return MoCentricMevis(split=split, task="ground")
     if dataset_name == "mevis_single_point_track":
         return Mevis(split=split, task="single_point_track")
     if dataset_name == "mevis_track_eval_1fps": # Used for eval
@@ -473,7 +475,7 @@ def get_dataset_by_name(dataset_name, split) -> Dataset:
         return MoCA(split=split, task="track")
     if dataset_name == "moca_ground":
         return MoCA(split=split, task="ground")
-    
+
     # Single object tracking datasets
     if dataset_name == "lvosv1_single_point_track":
         return LVOSv1(split=split, task="single_point_track")

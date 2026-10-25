@@ -105,14 +105,14 @@ class DatasetEvaluatorConfig(BaseConfig):
 
     save_data: Optional[SaveEvalDataConfig] = None
     """
-    Save low-level inputs/outputs, these can be used to make visualizations, but can also occupy 
+    Save low-level inputs/outputs, these can be used to make visualizations, but can also occupy
     a lot of disk space
     """
 
     model_config_override: Optional[BaseModelConfig] = None
 
     eval_name: Optional[str] = None
-    
+
     response_logits_only: bool = False
 
     enable_profiling: bool = False
@@ -123,11 +123,11 @@ class DatasetEvaluatorConfig(BaseConfig):
         return self.generative_evaluator is not None
 
     def build_evaluator(
-            self, 
-            model_config, 
-            device, 
-            default_save_dir, 
-            console_log_interval, 
+            self,
+            model_config,
+            device,
+            default_save_dir,
+            console_log_interval,
             include_image=False,
             mesh=None
         ):
@@ -351,8 +351,10 @@ class ModelEvaluator:
             model.to_empty(device=device)
             load_model_state(cfg.load_path, model)
             model.eval()
+            torch.cuda.empty_cache()
             if self.config.load_bf16:
-                model.to(torch.bfloat16)
+                #model.to(torch.bfloat16)
+                model.bfloat16()
                 logging.info("Converted model to bfloat16")
             torch.cuda.empty_cache()
 

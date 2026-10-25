@@ -18,7 +18,9 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed import DeviceMesh
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
+from peft import get_peft_model, LoraConfig
 from olmo import tokenizer
 from olmo.config import D, TransformerDataParallelWrappingStrategy
 from olmo.data.dynamic_packer import EXAMPLE_SUBSEGMENT_INCREMENT
@@ -43,6 +45,7 @@ from olmo.nn.llm import RoPEBuffers
 from olmo.nn.cp_load_balancer import CPLoadBalancerType, CPLoadBalancer
 from olmo.nn.vision_backbone import MolmoVisionBackbone, MolmoVisionBackboneConfig
 from olmo.torch_util import BufferCache, get_default_device
+from ...util import prepare_visual_encoder_for_lora, prepare_llm_for_lora
 
 log = logging.getLogger(__name__)
 
@@ -191,6 +194,7 @@ class Molmo2(ModelBase):
     def apply_activation_checkpointing(self):
         """Enable activation checkpointing"""
         self.transformer.apply_activation_checkpointing()
+        #wrapper_modules = [name for name, module in self.transformer.named_modules() if isinstance(module, CheckpointWrapper)]
         if self.vision_backbone is not None:
             self.vision_backbone.apply_activation_checkpointing()
 
@@ -371,6 +375,27 @@ class Molmo2(ModelBase):
         }
         return (param for name, param in self.named_parameters() if
                 any(part in exclude_list for part in name.split(".")))
+
+    def prepare_lora(self, lora):
+        if lora == 'llm':
+            lora_config = {'r':64, 'lora_alpha':128, 'lora_dropout':0.05, 'bias':'none', 'task_type':'CAUSAL_LM'}
+            self = prepare_llm_for_lora(lora_config, self)
+
+        elif lora == 'vit':
+            lora_config = {'r':32, 'lora_alpha':64, 'lora_dropout':0.05, 'bias':'none', 'task_type':None}
+            self = prepare_visual_encoder_for_lora(lora_config, self)
+
+    def merge_lora(self, lora):
+        try:
+            self.transformer = self.transformer.merge_and_unload()
+        except:
+            print("Skip language model, no LoRA in it !!!")
+
+        try:
+            self.vision_backbone.image_vit = self.vision_backbone.image_vit.merge_and_unload()
+        except:
+            print("Skip vision encoder, no LoRA in it !!!")
+        return
 
     @property
     def device(self) -> torch.device:
@@ -700,9 +725,9 @@ class Molmo2(ModelBase):
         image_pos_masks: Optional[List[torch.Tensor]] = None
         if images is not None:
             vision_backbone_output = self.vision_backbone(
-                images, 
-                image_masks, 
-                token_pooling, 
+                images,
+                image_masks,
+                token_pooling,
                 enable_cp=enable_cp,
                 cum_image_bounds=kwargs.get('cum_image_bounds'),
                 cum_token_pooling_bounds=kwargs.get('cum_token_pooling_bounds'),
