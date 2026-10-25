@@ -22,7 +22,6 @@ from omegaconf import OmegaConf
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from wandb.sdk.wandb_run import Run
-from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
 
 from olmo.exceptions import OLMoCliError, OLMoConfigurationError
 from olmo.io import file_exists, write_file
@@ -48,31 +47,9 @@ from olmo.util import (
     log_extra_field,
     prepare_torchrun_environment,
 )
-from ..util import find_all_linear_names
+from ..util import prepare_visual_encoder_for_lora, prepare_llm_for_lora
 
 log = logging.getLogger("train")
-
-def prepare_llm_for_lora(lora_config,
-                         model,
-                         use_activation_checkpointing=True):
-    lora_config = LoraConfig(**lora_config)
-    model.transformer = prepare_model_for_kbit_training(
-        model.transformer, use_activation_checkpointing)
-    if lora_config.target_modules is None:
-        modules = find_all_linear_names(model.transformer)
-        lora_config.target_modules = modules
-    model.transformer = get_peft_model(model.transformer,
-                                          lora_config)
-    return model
-
-def prepare_visual_encoder_for_lora(lora_config, model):
-    lora_config = LoraConfig(**lora_config)
-    if lora_config.target_modules is None:
-        modules = find_all_linear_names(model.vision_backbone)
-        lora_config.target_modules = modules
-    model.vision_backbone = get_peft_model(model.vision_backbone,
-                                             lora_config)
-    return model
 
 def run_trainer(cfg: TrainConfig) -> None:
     if cfg.run_name is None:
@@ -256,7 +233,6 @@ def run_trainer(cfg: TrainConfig) -> None:
         fsdp_model = olmo_model
 
     torch.cuda.empty_cache()
-
     log.info(f"Total number of parameters: {olmo_model.num_params():,d}")
     log.info(f"Number of non-embedding parameters: {olmo_model.num_params(include_embedding=False):,d}")
     if olmo_model.config.llm.block_type == "moe":

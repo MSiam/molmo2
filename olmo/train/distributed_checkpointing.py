@@ -44,6 +44,8 @@ from torch.distributed.checkpoint.default_planner import DefaultSavePlanner, Def
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 #from torch.distributed.checkpoint.optimizer import DefaultLoadPlanner
 
+from peft.tuners.lora.layer import Linear as LoraLinear
+
 from olmo.config import StrEnum
 from olmo.io import PathOrStr, normalize_path, clear_directory, dir_is_empty, is_url
 from olmo.torch_util import barrier, get_fs_local_rank, get_global_rank, is_distributed, gc_cuda, get_world_size
@@ -235,8 +237,18 @@ def load_model_and_optim_state(
     """
     dir = normalize_path(dir)
     state_dict = _prepare_state_dict(model, optim, process_group=process_group)
+
+#    has_lora_linear = any(isinstance(m, LoraLinear) for m in model.modules())
     if lora_allow_missing_keys:
+        # State_dict has original weights and Only do the mapping if Lora doesnt exist in the loaded weights
         state_dict = {'model': {k: v for k, v in state_dict['model'].items() if 'lora' not in k}}
+        key_mapping = {k: k.replace('base_layer.', '').replace('image_vit.base_model.model.', 'image_vit.') \
+                        for k in state_dict['model'].keys() if 'base_layer' in k or 'image_vit' in k}
+#    elif has_lora_linear:
+#        # If loading weights with already lora weights, simply fix the image_vit names
+#        key_mapping = {k: k.replace('base_model.model.image_vit.', 'image_vit.base_model.model.').replace('vision_backbone.base_model.model.', 'vision_backbone.') \
+#                          for k in state_dict['model'].keys() if 'vision_backbone' in k}
+
     reader = dist_cp.FileSystemReader(dir)#RemoteFileSystemReader(
 #        dir, thread_count=thread_count, pre_download=pre_download, work_dir=work_dir
 #    )
@@ -365,7 +377,7 @@ def load_model_and_optim_state(
 
     if key_mapping is not None:
         for current_key, original_key in key_mapping.items():
-            if f"model.{original_key}" not in metadata.state_dict_metadata:
+            if not (not lora_allow_missing_keys and has_lora_linear) and f"model.{original_key}" not in metadata.state_dict_metadata:
                 continue
 
             state_dict["model"][current_key] = state_dict["model"].pop(original_key)
@@ -386,6 +398,7 @@ def load_model_and_optim_state(
         model, state_dict["model"], options=dist_cp_sd.StateDictOptions(strict=not lora_allow_missing_keys)
     )
     gc_cuda()
+    torch.cuda.empty_cache()
 
     if optim is not None and 'optim' in state_dict:
         dist_cp_sd.set_optimizer_state_dict(

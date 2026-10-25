@@ -45,7 +45,7 @@ from olmo.nn.llm import RoPEBuffers
 from olmo.nn.cp_load_balancer import CPLoadBalancerType, CPLoadBalancer
 from olmo.nn.vision_backbone import MolmoVisionBackbone, MolmoVisionBackboneConfig
 from olmo.torch_util import BufferCache, get_default_device
-from ...util import find_all_linear_names
+from ...util import prepare_visual_encoder_for_lora, prepare_llm_for_lora
 
 log = logging.getLogger(__name__)
 
@@ -379,19 +379,11 @@ class Molmo2(ModelBase):
     def prepare_lora(self, lora):
         if lora == 'llm':
             lora_config = {'r':64, 'lora_alpha':128, 'lora_dropout':0.05, 'bias':'none', 'task_type':'CAUSAL_LM'}
-            lora_config = LoraConfig(**lora_config)
-            if lora_config.target_modules is None:
-                modules = find_all_linear_names(self.transformer)
-                lora_config.target_modules = modules
-            self.transformer = get_peft_model(self.transformer, lora_config)
+            self = prepare_llm_for_lora(lora_config, self)
 
         elif lora == 'vit':
             lora_config = {'r':32, 'lora_alpha':64, 'lora_dropout':0.05, 'bias':'none', 'task_type':None}
-            lora_config = LoraConfig(**lora_config)
-            if lora_config.target_modules is None:
-                modules = find_all_linear_names(self.vision_backbone)
-                lora_config.target_modules = modules
-            self.vision_backbone = get_peft_model(self.vision_backbone, lora_config)
+            self = prepare_visual_encoder_for_lora(lora_config, self)
 
     def merge_lora(self, lora):
         try:
@@ -400,7 +392,7 @@ class Molmo2(ModelBase):
             print("Skip language model, no LoRA in it !!!")
 
         try:
-            self.vision_backbone = self.vision_backbone.merge_and_unload()
+            self.vision_backbone.image_vit = self.vision_backbone.image_vit.merge_and_unload()
         except:
             print("Skip vision encoder, no LoRA in it !!!")
         return

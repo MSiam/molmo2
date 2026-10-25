@@ -243,6 +243,7 @@ def get_model(checkpoint, model):
         loading_method="torchcodec_exact",
         frame_sample_mode="uniform_last_frame",
         max_fps=[2],
+        per_frame_special_token=True,
     )
     if isinstance(model_cfg.mm_preprocessor, MultiCropConfig):
         # Might be starting from a `Molmo` not a Molmo2` model
@@ -499,6 +500,7 @@ def main():
     parser.add_argument("--hf_ckpt_load", action="store_true")
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--debug_no_load_weights", action="store_true")
     parser.add_argument("--lora", type=str, default="")
     parser.add_argument("--model", default="video")
     parser.add_argument("--seq_len", type=int, default=16384)
@@ -543,7 +545,6 @@ def main():
     seq_len = args.seq_len
 
     if args.hf_ckpt_load:
-        # I ended up not need it for the LoRA tuning keeping it for debugging
         default_checkpoint = "./default_ckpt"
         os.makedirs(default_checkpoint, exist_ok=True)
 
@@ -644,7 +645,7 @@ def main():
         ),
         compile=CompilerConfig(mode="default", dynamic=False),
         fused_loss=False,
-        allow_resume=True,
+        allow_resume=True if not args.debug_no_load_weights else False,
         model=model_cfg,
         save_overwrite=True,
         data=DataLoaderConfig(
@@ -669,10 +670,12 @@ def main():
         lora_config_vit=lora_config_vit,
         optimizer=OptimizerConfig(
             name=OptimizerType.adamw,
-            connector_learning_rate=5e-6,
-            vit_learning_rate=5e-6,
-            llm_learning_rate=1e-5,
-            frame_selector_learning_rate=1e-4,
+            connector_learning_rate=4e-5,#5e-6,
+            vit_learning_rate=4e-5,#5e-6,
+            llm_learning_rate=4e-5,#1e-5,
+            frame_selector_learning_rate=4e-5,#1e-4,
+            connector_weight_decay=0.05,
+            vit_weight_decay=0.05,
         ),
         scheduler=SchedulerConfig(
             name=SchedulerType.multimodal,
@@ -685,7 +688,7 @@ def main():
         ),
         fsdp=FSDPConfig(fsdp2=True),
         load_path=None,
-        initial_model_checkpoint=checkpoint,
+        initial_model_checkpoint=checkpoint if not args.debug_no_load_weights else None,
         save_interval=2000,
         save_num_checkpoints_to_keep=1,
         global_train_batch_size=get_world_size() if args.debug else 1,

@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=None,
                         help="Override max new tokens, otherwise use task-specific default")
     parser.add_argument("--response_logits_only", action="store_true")
+    parser.add_argument("--debug_no_load_weights", action="store_true")
     args, other_args = parser.parse_known_args()
 
     checkpoint_dir = select_checkpoint(args.checkpoint)
@@ -77,7 +78,7 @@ def main():
         pbar=False,
         model=model_cfg,
         evaluations=[eval_config],
-        load_path=checkpoint_dir,
+        load_path=checkpoint_dir if not args.debug_no_load_weights else "debug",
         console_log_interval=10,
         fsdp=FSDPConfig(fsdp2=True) if args.fsdp else None,
         save_to_checkpoint_dir=args.save_dir is None,
